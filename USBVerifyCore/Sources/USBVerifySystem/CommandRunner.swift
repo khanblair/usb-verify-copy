@@ -26,6 +26,8 @@ public struct ProcessCommandRunner: CommandRunner {
         let stderrPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        // A child process must never read the app's own stdin.
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
