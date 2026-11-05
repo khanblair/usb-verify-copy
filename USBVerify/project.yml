@@ -1,0 +1,47 @@
+name: USBVerify
+options:
+  deploymentTarget:
+    macOS: "27.0"
+  bundleIdPrefix: dev.khanblair
+packages:
+  USBVerifyCore:
+    path: ../USBVerifyCore
+targets:
+  USBVerify:
+    type: application
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - USBVerify
+    info:
+      path: USBVerify/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.khanblair.USBVerify
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        INFOPLIST_KEY_NSRemovableVolumesUsageDescription: USB Verify copies the files you choose to a USB drive and checks them.
+        INFOPLIST_KEY_NSDesktopFolderUsageDescription: USB Verify copies the files you choose to a USB drive and checks them.
+        INFOPLIST_KEY_NSDocumentsFolderUsageDescription: USB Verify copies the files you choose to a USB drive and checks them.
+        INFOPLIST_KEY_NSDownloadsFolderUsageDescription: USB Verify copies the files you choose to a USB drive and checks them.
+    dependencies:
+      - package: USBVerifyCore
+        product: USBVerifyCore
+      - package: USBVerifyCore
+        product: USBVerifySystem
+  USBVerifyTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - USBVerifyTests
+    dependencies:
+      - target: USBVerify
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
