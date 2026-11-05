@@ -17,7 +17,21 @@ final class AppModel {
     var jobs: [PersistedJob] = []
     var history: [RunRecord] = []
     var snapshots: [String: ProgressSnapshot] = [:]
+    var phases: [String: JobPhase] = [:]
+    var warnings: [String: [String]] = [:]
+    var waitingForUnmount: [String: [String]] = [:]
+    var fileResults: [String: [Int: FileResult]] = [:]
     var routeSummaries: [RouteSummary] = []
+    var isOnBattery = false
+    var lastErrorMessage: String?
+    var lastErrorDetail: String?
+    var preflightIssues: [(message: String, detail: String)] = []
+    var resumableJobIDs: Set<String> = []
+    var reconnectMessages: [String: String] = [:]
+
+    private var volumeObserverStarted = false
+    private var wakeObserverStarted = false
+    private var eventTasks: [String: Task<Void, Never>] = [:]
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -36,10 +50,14 @@ final class AppModel {
 
     func refresh() async {
         volumes = await dependencies.volumeEvents.currentVolumes()
+        coordinator.setCurrentVolumes(volumes)
+        isOnBattery = dependencies.powerGuard.isOnBattery
         history = (try? await dependencies.historyStore.loadAll()) ?? []
         routeSummaries = RouteHistory.summaries(from: history)
-        observeEvents()
-        observeJobEvents()
+        clearRemovedSelection()
+        startObserversIfNeeded()
+        jobs = coordinator.jobs
+        for job in jobs where job.pausedReason != nil { updateResumableState(for: job) }
     }
 
     func presentCopySheet(for volume: Volume? = nil) {
@@ -51,37 +69,50 @@ final class AppModel {
     func startCopy(_ request: CopyRequest) {
         do {
             let planned = try CopyPlanner.plan(request: request, io: dependencies.driveIO)
-            guard planned.report.isOK else { return }
+            guard planned.report.isOK else {
+                setPreflightIssues(planned.report.issues)
+                return
+            }
             coordinator.start(planned.job, volume: request.volume)
+            isOnBattery = dependencies.powerGuard.isOnBattery
             jobs = coordinator.jobs
+            observeJobEvents(for: planned.job.id)
             selectedRoute = .jobs
             showingCopySheet = false
+            lastErrorMessage = nil
+            lastErrorDetail = nil
         } catch {
-            showingCopySheet = false
+            show(error: error)
         }
     }
 
     func resume(jobID: String) {
         guard let job = jobs.first(where: { $0.id == jobID }),
-            let volume = volumes.first(where: { $0.id == job.volumeID })
+              let volume = volumes.first(where: { $0.id == job.volumeID })
         else { return }
         coordinator.resume(job, volume: volume)
+        isOnBattery = dependencies.powerGuard.isOnBattery
+        observeJobEvents(for: jobID)
+        resumableJobIDs.remove(jobID)
     }
 
     func cancel(jobID: String, deletePartial: Bool) {
-        guard jobs.contains(where: { $0.id == jobID }) else { return }
-        coordinator.requestCancel()
-        _ = deletePartial
+        Task { await coordinator.cancel(jobID: jobID, deletePartial: deletePartial) }
     }
 
     func retryUnmount(jobID: String) {
-        _ = jobID
+        guard coordinator.activeJobID == jobID else { return }
         coordinator.retryUnmount()
     }
 
     func keepScanning(jobID: String, fileIndex: Int) {
-        _ = jobID
-        _ = fileIndex
+        coordinator.keepScanning(jobID: jobID, fileIndex: fileIndex)
+        observeJobEvents(for: jobID)
+    }
+
+    func prepareForQuit() async {
+        await coordinator.prepareForQuit()
+        jobs = coordinator.jobs
     }
 
     func eject(volume: Volume) {
@@ -90,35 +121,109 @@ final class AppModel {
 
     func dismiss(jobID: String) { jobs.removeAll { $0.id == jobID } }
 
-    private func observeEvents() {
-        Task { [weak self] in
-            guard let self else { return }
-            for await event in dependencies.volumeEvents.events() {
-                switch event {
-                case .added(let volume), .changed(let volume):
-                    if let index = volumes.firstIndex(where: { $0.id == volume.id }) {
-                        volumes[index] = volume
-                    } else {
-                        volumes.append(volume)
-                    }
-                case .removed(let id):
-                    volumes.removeAll { $0.id == id }
-                    if coordinator.jobs.contains(where: { $0.volumeID == id }) {
-                        coordinator.requestPause(.driveDisconnected)
-                    }
+    private func startObserversIfNeeded() {
+        if !volumeObserverStarted {
+            volumeObserverStarted = true
+            Task { [weak self] in await self?.observeVolumes() }
+        }
+        if !wakeObserverStarted {
+            wakeObserverStarted = true
+            Task { [weak self] in await self?.observeWakeEvents() }
+        }
+    }
+
+    private func observeVolumes() async {
+        for await event in dependencies.volumeEvents.events() {
+            switch event {
+            case .added(let volume), .changed(let volume):
+                let wasAbsent = !volumes.contains { $0.id == volume.id }
+                if let index = volumes.firstIndex(where: { $0.id == volume.id }) { volumes[index] = volume }
+                else { volumes.append(volume) }
+                coordinator.setCurrentVolumes(volumes)
+                if wasAbsent { announceDriveBack(volume) }
+            case .removed(let id):
+                volumes.removeAll { $0.id == id }
+                coordinator.setCurrentVolumes(volumes)
+                clearRemovedSelection()
+                if coordinator.jobs.first(where: { $0.id == coordinator.activeJobID })?.volumeID == id {
+                    coordinator.requestPause(.driveDisconnected)
                 }
             }
         }
     }
 
-    private func observeJobEvents() {
-        guard let stream = coordinator.events else { return }
-        Task { [weak self] in
+    private func observeWakeEvents() async {
+        for await _ in dependencies.powerGuard.wakeEvents() {
+            if coordinator.isRunning { coordinator.requestPause(.wake) }
+        }
+    }
+
+    private func observeJobEvents(for jobID: String) {
+        guard eventTasks[jobID] == nil else { return }
+        let stream = coordinator.events(for: jobID)
+        eventTasks[jobID] = Task { [weak self] in
             guard let self else { return }
-            for await event in stream {
-                if case .progress(let snapshot) = event { snapshots["active"] = snapshot }
-                jobs = coordinator.jobs
+            for await event in stream { apply(event, to: jobID) }
+        }
+    }
+
+    private func apply(_ event: JobEvent, to jobID: String) {
+        switch event {
+        case .progress(let snapshot): snapshots[jobID] = snapshot
+        case .phase(let fileIndex, let phase): phases["\(jobID):\(fileIndex)"] = phase
+        case .warning(let warning): warnings[jobID, default: []].append(warning)
+        case .waitingForUnmount(let blockers): waitingForUnmount[jobID] = blockers
+        case .fileFinished(let index, let result): fileResults[jobID, default: [:]][index] = result
+        case .paused, .finished:
+            jobs = coordinator.jobs
+            if case .finished = event {
+                Task { await reloadHistory() }
             }
         }
+    }
+
+    private func announceDriveBack(_ volume: Volume) {
+        for job in jobs where job.volumeID == volume.id && job.pausedReason != nil {
+            resumableJobIDs.insert(job.id)
+            Task {
+                await dependencies.notifier.notify(
+                    title: "Drive is back",
+                    body: "\(volume.name) is back. Resume?")
+            }
+        }
+    }
+
+    private func updateResumableState(for job: PersistedJob) {
+        if volumes.contains(where: { $0.id == job.volumeID }) { resumableJobIDs.insert(job.id) }
+        else { reconnectMessages[job.id] = "Reconnect the drive" }
+    }
+
+    private func clearRemovedSelection() {
+        if let selectedVolume, !volumes.contains(where: { $0.id == selectedVolume.id }) { self.selectedVolume = nil }
+    }
+
+    private func setPreflightIssues(_ issues: [PreflightIssue]) {
+        preflightIssues = issues.map { issue in
+            let error = issue.error
+            return (error.plainMessage, error.technicalDetail)
+        }
+        lastErrorMessage = preflightIssues.first?.message
+        lastErrorDetail = preflightIssues.first?.detail
+    }
+
+    private func show(error: Error) {
+        if let error = error as? any UserFacingError {
+            lastErrorMessage = error.plainMessage
+            lastErrorDetail = error.technicalDetail
+        } else {
+            lastErrorMessage = "The copy could not be started."
+            lastErrorDetail = String(describing: error)
+        }
+        showingCopySheet = false
+    }
+
+    private func reloadHistory() async {
+        history = (try? await dependencies.historyStore.loadAll()) ?? []
+        routeSummaries = RouteHistory.summaries(from: history)
     }
 }

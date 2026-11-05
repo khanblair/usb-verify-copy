@@ -19,6 +19,7 @@ enum ConflictChoice: String, CaseIterable, Sendable {
 struct PlannedJob: Sendable {
     let job: PersistedJob
     let report: PreflightReport
+    let removeDotFilesAfter: Bool
 }
 
 enum CopyPlanner {
@@ -44,7 +45,8 @@ enum CopyPlanner {
         }
         let report = Preflight.check(volume: request.volume, files: files)
         return PlannedJob(
-            job: PersistedJob(mode: request.mode, volumeID: request.volume.id, files: states), report: report)
+            job: PersistedJob(mode: request.mode, volumeID: request.volume.id, files: states), report: report,
+            removeDotFilesAfter: request.removeDotFilesAfter)
     }
 
     private static func destinationName(
