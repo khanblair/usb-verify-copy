@@ -14,7 +14,10 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
     private let lock = NSLock()
     private let mountPath: String
     private let capacityBytes: Int64
+    private let physicalCapacityBytes: Int64?
     private var files: [String: File] = [:]
+    private var creationOrder: [String] = []
+    private var damagedOverflowBytes: Int64 = 0
     private var sources: [String: Source] = [:]
     private var writeFlips: [(offset: Int64, remaining: Int)] = []
     private var remountCorruption: [(suffix: String, offset: Int64)] = []
@@ -26,9 +29,13 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
     private var _writeCount = 0
     private var _readCount = 0
 
-    public init(mountPath: String, capacityBytes: Int64 = Int64.max) {
+    public init(
+        mountPath: String, capacityBytes: Int64 = Int64.max,
+        physicalCapacityBytes: Int64? = nil
+    ) {
         self.mountPath = mountPath.hasSuffix("/") ? String(mountPath.dropLast()) : mountPath
         self.capacityBytes = capacityBytes
+        self.physicalCapacityBytes = physicalCapacityBytes
     }
     public func addSource(path: String, data: [UInt8], modifiedTimeNs: Int64 = 1, inode: UInt64 = 1) {
         lock.withLock { sources[path] = Source(data: data, modifiedTimeNs: modifiedTimeNs, inode: inode) }
@@ -101,7 +108,10 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
         try checkPath(path)
         try checkConnected(0)
         lock.lock()
-        if truncate || files[path] == nil { files[path] = File(device: [], cache: []) }
+        if truncate || files[path] == nil {
+            if files[path] == nil { creationOrder.append(path) }
+            files[path] = File(device: [], cache: [])
+        }
         lock.unlock()
         return FakeWriter(drive: self, path: path)
     }
@@ -122,7 +132,12 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
         try checkPath(from)
         try checkPath(to)
         try checkConnected(0)
-        lock.withLock { if let file = files.removeValue(forKey: from) { files[to] = file } }
+        lock.withLock {
+            if let file = files.removeValue(forKey: from) {
+                files[to] = file
+                if let index = creationOrder.firstIndex(of: from) { creationOrder[index] = to }
+            }
+        }
     }
     public func removeFile(path: String) throws {
         try checkPath(path)
@@ -212,7 +227,26 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
         file.device.replaceSubrange(Int(offset)..<Int(end), with: stored)
         writeFlips.removeAll { $0.remaining == 0 }
         files[path] = file
+        damageWrapAroundIfNeeded(writing: path)
         _writeCount += 1
+    }
+    private func damageWrapAroundIfNeeded(writing path: String) {
+        guard let physicalCapacityBytes else { return }
+        let used = files.values.reduce(Int64(0)) { $0 + Int64($1.device.count) }
+        guard used > physicalCapacityBytes else { return }
+        let overflow = used - physicalCapacityBytes
+        guard let targetPath = creationOrder.first(where: { $0 != path }), var target = files[targetPath] else {
+            return
+        }
+        let newOverflow = max(0, overflow - damagedOverflowBytes)
+        damagedOverflowBytes = max(damagedOverflowBytes, overflow)
+        let steps = (newOverflow + 4095) / 4096
+        for step in 0..<steps {
+            let offset = step * 4096
+            guard offset < Int64(target.device.count) else { break }
+            target.device[Int(offset)] ^= 1
+        }
+        files[targetPath] = target
     }
     fileprivate func warning() -> String? { fullSyncWarning }
 }
