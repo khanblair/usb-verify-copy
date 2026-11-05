@@ -82,7 +82,28 @@ public final class PosixDriveIO: DriveIO, @unchecked Sendable {
         Darwin.fcntl(descriptor, F_NOCACHE, 0) > 0
     }
 
-    fileprivate func mapError(operation: String, code: Int32, path: String, offset: Int64) -> VerifyError {
+    internal func sourceHasNoCache(path: String) throws -> Bool {
+        let source = try openSource(path: path)
+        let result = (source as? PosixSourceFile)?.hasNoCache ?? false
+        source.close()
+        return result
+    }
+
+    internal func writerHasNoCache(path: String) throws -> Bool {
+        let writer = try createWriter(path: path, truncate: false)
+        let result = (writer as? PosixWriter)?.hasNoCache ?? false
+        try writer.close()
+        return result
+    }
+
+    internal func readerHasNoCache(path: String) throws -> Bool {
+        let reader = try openReader(path: path)
+        let result = (reader as? PosixReader)?.hasNoCache ?? false
+        reader.close()
+        return result
+    }
+
+    internal func mapError(operation: String, code: Int32, path: String, offset: Int64) -> VerifyError {
         switch code {
         case ENOSPC, EDQUOT: return .noSpace(needed: 0, available: 0)
         case EACCES, EPERM, EROFS: return .permissionDenied(path: path)
@@ -112,6 +133,7 @@ public final class PosixDriveIO: DriveIO, @unchecked Sendable {
 private final class PosixSourceFile: SourceFile, @unchecked Sendable {
     private let fd: Int32
     let identity: FileIdentity
+    let hasNoCache = true
     private var closed = false
     init(fd: Int32, identity: FileIdentity) {
         self.fd = fd
@@ -146,6 +168,7 @@ private final class PosixWriter: DestinationWriter, @unchecked Sendable {
     private let fd: Int32
     private let path: String
     private var closed = false
+    let hasNoCache = true
     init(fd: Int32, path: String) {
         self.fd = fd
         self.path = path
@@ -185,6 +208,7 @@ private final class PosixReader: DestinationReader, @unchecked Sendable {
     private let path: String
     let size: Int64
     private var closed = false
+    let hasNoCache = true
     init(fd: Int32, path: String, size: Int64) {
         self.fd = fd
         self.path = path

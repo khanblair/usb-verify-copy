@@ -61,3 +61,56 @@ private func temporaryFolder() throws -> String {
     #expect(drive.fileSize(path: renamed) == nil)
     #expect(try drive.freeSpace(path: folder) > 0)
 }
+
+@Test
+func posixDescriptorsUseNoCacheAndReadsStopAtEnd() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(atPath: folder) }
+    let path = (folder as NSString).appendingPathComponent("data.bin")
+    let drive = PosixDriveIO()
+    let writer = try drive.createWriter(path: path, truncate: true)
+    try [UInt8(1), 2, 3].withUnsafeBytes { try writer.write($0, at: 0) }
+    try writer.close()
+
+    #expect(try drive.sourceHasNoCache(path: path))
+    #expect(try drive.writerHasNoCache(path: path))
+    #expect(try drive.readerHasNoCache(path: path))
+    let source = try drive.openSource(path: path)
+    var bytes = [UInt8](repeating: 0, count: 5)
+    let short = try bytes.withUnsafeMutableBytes { try source.read(into: $0, at: 0) }
+    let past = try bytes.withUnsafeMutableBytes { try source.read(into: $0, at: 3) }
+    source.close()
+    #expect(short == 3)
+    #expect(past == 0)
+}
+
+@Test
+func truncateFalseKeepsContentAndRenameReplacesExisting() throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(atPath: folder) }
+    let first = (folder as NSString).appendingPathComponent("first.bin")
+    let second = (folder as NSString).appendingPathComponent("second.bin")
+    let drive = PosixDriveIO()
+    let writer = try drive.createWriter(path: first, truncate: true)
+    try [UInt8(1), 2, 3].withUnsafeBytes { try writer.write($0, at: 0) }
+    try writer.close()
+    let appendWriter = try drive.createWriter(path: first, truncate: false)
+    try [UInt8(9)].withUnsafeBytes { try appendWriter.write($0, at: 3) }
+    try appendWriter.close()
+    let existing = try drive.createWriter(path: second, truncate: true)
+    try [UInt8(8)].withUnsafeBytes { try existing.write($0, at: 0) }
+    try existing.close()
+
+    try drive.rename(from: first, to: second)
+    #expect(drive.fileSize(path: first) == nil)
+    #expect(drive.fileSize(path: second) == 4)
+}
+
+@Test
+func posixErrorMappingCoversKnownAndUnknownErrors() {
+    let drive = PosixDriveIO()
+    #expect(drive.mapError(operation: "write", code: ENOSPC, path: "x", offset: 0) == .noSpace(needed: 0, available: 0))
+    #expect(drive.mapError(operation: "open", code: EACCES, path: "x", offset: 0) == .permissionDenied(path: "x"))
+    #expect(drive.mapError(operation: "read", code: EIO, path: "x", offset: 4) == .driveDisconnected(atOffset: 4))
+    #expect(drive.mapError(operation: "read", code: 12345, path: "x", offset: 4) == .io(operation: "read", code: 12345))
+}
