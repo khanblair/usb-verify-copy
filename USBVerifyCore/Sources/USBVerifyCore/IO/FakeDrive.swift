@@ -18,6 +18,7 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
     private var files: [String: File] = [:]
     private var creationOrder: [String] = []
     private var damagedOverflowBytes: Int64 = 0
+    private var damagedOffsets: Set<Int64> = []
     private var sources: [String: Source] = [:]
     private var writeFlips: [(offset: Int64, remaining: Int)] = []
     private var remountCorruption: [(suffix: String, offset: Int64)] = []
@@ -235,7 +236,11 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
         let used = files.values.reduce(Int64(0)) { $0 + Int64($1.device.count) }
         guard used > physicalCapacityBytes else { return }
         let overflow = used - physicalCapacityBytes
-        guard let targetPath = creationOrder.first(where: { $0 != path }), var target = files[targetPath] else {
+        guard
+            let targetPath = creationOrder.first(where: {
+                $0 != path && URL(fileURLWithPath: $0).lastPathComponent.hasPrefix(Defaults.capacityTestPrefix)
+            }), var target = files[targetPath]
+        else {
             return
         }
         let newOverflow = max(0, overflow - damagedOverflowBytes)
@@ -244,7 +249,9 @@ public final class FakeDrive: DriveIO, @unchecked Sendable {
         for step in 0..<steps {
             let offset = step * 4096
             guard offset < Int64(target.device.count) else { break }
-            target.device[Int(offset)] ^= 1
+            if damagedOffsets.insert(offset).inserted {
+                target.device[Int(offset)] ^= 1
+            }
         }
         files[targetPath] = target
     }

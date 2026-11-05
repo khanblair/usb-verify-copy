@@ -141,7 +141,7 @@ public final class CapacityRunner: @unchecked Sendable {
         var endedBecauseFull = false
         var disconnected = false
         do {
-            freeAtStart = try io.freeSpace(path: volume.mountPath)
+            freeAtStart = try io.freeSpace(path: freeSpacePath())
             totalBytes = max(freeAtStart - max(config.reserveBytes, 0), 1)
             currentPhase = .copying
             continuation.yield(.phase(fileIndex: 0, .copying))
@@ -196,7 +196,7 @@ public final class CapacityRunner: @unchecked Sendable {
         guard config.testFileSize > 0 else { throw VerifyError.io(operation: "capacity size", code: EINVAL) }
         while true {
             try checkControl(currentFileBytes)
-            let free = try io.freeSpace(path: volume.mountPath)
+            let free = try io.freeSpace(path: freeSpacePath())
             if free <= max(config.reserveBytes, 0) { return true }
             let length = min(config.testFileSize, free - max(config.reserveBytes, 0))
             guard length > 0 else { return true }
@@ -207,14 +207,17 @@ public final class CapacityRunner: @unchecked Sendable {
                 nameIndex += 1
             } while io.fileSize(path: (try? filePath(currentFileName)) ?? "") != nil
             currentFileBytes = 0
+            manifest.names.append(currentFileName)
+            manifest.sizes.append(length)
+            saveManifest()
             do {
                 try writeFile(name: currentFileName, length: length, fileIndex: currentFileIndex)
             } catch VerifyError.noSpace {
                 try? removeFile(name: currentFileName)
+                manifest.names.removeLast()
+                manifest.sizes.removeLast()
                 return true
             }
-            manifest.names.append(currentFileName)
-            manifest.sizes.append(length)
             testedBytes += length
             saveManifest()
             emitProgress()
@@ -368,6 +371,10 @@ public final class CapacityRunner: @unchecked Sendable {
 
     private func filePath(_ name: String) throws -> String {
         try DestinationGuard(volume: volume).path(folder: config.folder, name: name)
+    }
+
+    private func freeSpacePath() -> String {
+        volume.mountPath + "/"
     }
 
     private func removeFile(name: String) throws {
