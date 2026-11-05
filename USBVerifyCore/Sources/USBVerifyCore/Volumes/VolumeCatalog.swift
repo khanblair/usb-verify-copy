@@ -1,0 +1,25 @@
+public enum VolumeCatalog {
+    public static func makeVolume(from d: DiskDescription, route: Route? = nil) -> Volume? {
+        guard let uuid = d.volumeUUID, !uuid.isEmpty, let path = d.volumePath,
+            d.deviceInternal == false, !d.isBootVolume, !d.isNetwork,
+            d.protocolName != "Virtual Interface"
+        else { return nil }
+        return Volume(
+            id: VolumeID(uuid), name: d.volumeName ?? "Untitled", mountPath: path,
+            bsdName: d.bsdName, wholeDiskBSDName: d.wholeDiskBSDName ?? wholeDiskName(fromBSDName: d.bsdName),
+            model: d.modelName, protocolName: d.protocolName ?? "Unknown",
+            filesystem: .from(volumeKind: d.volumeKind), totalBytes: d.totalBytes,
+            freeBytes: d.freeBytes, isReadOnly: d.isReadOnly,
+            hasTimeMachineBackups: d.hasTimeMachineBackups, route: route)
+    }
+
+    public static func filter(_ descriptions: [DiskDescription]) -> [Volume] {
+        descriptions.compactMap { makeVolume(from: $0) }
+    }
+
+    public static func wholeDiskName(fromBSDName bsd: String) -> String {
+        guard let sIndex = bsd.lastIndex(of: "s") else { return bsd }
+        let suffix = bsd[bsd.index(after: sIndex)...]
+        return !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) ? String(bsd[..<sIndex]) : bsd
+    }
+}
