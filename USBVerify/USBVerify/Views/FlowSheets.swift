@@ -87,8 +87,20 @@ struct FormatSheet: View {
                     Text("BSD id: \(request.volume.wholeDiskBSDName)")
                     Text("Model: \(request.volume.model ?? "unknown")")
                     Section("Partitions") {
-                        Text(request.volume.bsdName)
-                            .font(.body.monospaced())
+                        Text("All partitions on this disk will be erased.")
+                            .foregroundStyle(.red)
+                        ForEach(
+                            FormatPresentation.partitions(for: request.volume, among: model.volumes)
+                        ) { partition in
+                            HStack {
+                                Text(partition.name)
+                                Spacer()
+                                Text(Formatting.bytes(partition.size))
+                                Text(partition.filesystem)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .font(.caption)
+                        }
                     }
                     TextField(
                         "New label",
@@ -106,6 +118,13 @@ struct FormatSheet: View {
                     if let errorText {
                         Text(errorText).foregroundStyle(.red)
                     }
+                    if let output = model.formatOutput {
+                        DisclosureGroup("diskutil output") {
+                            Text(output)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
                 HStack {
                     Spacer()
@@ -116,7 +135,7 @@ struct FormatSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 560, height: 530)
+        .frame(width: 560, height: 600)
         .onAppear { request = model.formatRequest }
     }
 
@@ -156,6 +175,10 @@ struct CapacitySheet: View {
                 .pickerStyle(.segmented)
                 Text("A fake-capacity drive can damage existing files. Back up the drive before testing it.")
                     .foregroundStyle(.orange)
+                if request.mode == .wholeDrive {
+                    Text("Whole drive mode formats the drive first. All partitions and files will be erased.")
+                        .foregroundStyle(.red)
+                }
                 Text("Test size: \(Formatting.bytes(request.config.testFileSize))")
                     .foregroundStyle(.secondary)
                 HStack {

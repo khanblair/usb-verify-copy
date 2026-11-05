@@ -42,8 +42,24 @@ struct RootView: View {
         .sheet(isPresented: $model.showingCapacitySheet) {
             CapacitySheet(model: model)
         }
+        .sheet(isPresented: $model.showingCapacityReport) {
+            if let report = model.capacityReport {
+                CapacityReportSheet(report: report)
+            }
+        }
         .sheet(item: $model.pendingCleanup) { confirmation in
             CleanupConfirmationSheet(model: model, confirmation: confirmation)
+        }
+        .alert(
+            "macOS needs your admin password to erase this drive",
+            isPresented: Binding(
+                get: { model.formatRetryRequest != nil },
+                set: { if !$0 { model.formatRetryRequest = nil } })
+        ) {
+            Button("Retry as administrator") { model.confirmFormatRetry() }
+            Button("Cancel", role: .cancel) { model.formatRetryRequest = nil }
+        } message: {
+            Text("The first erase attempt was denied. USB Verify will retry only after you confirm.")
         }
     }
 }
@@ -126,6 +142,49 @@ private struct FactRow: View {
             Text(label).foregroundStyle(.secondary)
             Spacer()
             Text(value).monospacedDigit()
+        }
+    }
+}
+
+private struct CapacityReportSheet: View {
+    let report: CapacityReport
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Capacity result").font(.title2.weight(.semibold))
+            Text(verdict).font(.title3.weight(.medium))
+            LabeledContent("Tested", value: Formatting.bytes(report.testedBytes))
+            LabeledContent("Good files", value: "\(report.goodFiles)")
+            if report.badFiles.isEmpty {
+                Text("No bad files were found.").foregroundStyle(.secondary)
+            } else {
+                Text("Bad files").font(.headline)
+                List(report.badFiles, id: \.name) { file in
+                    VStack(alignment: .leading) {
+                        Text(file.name)
+                        ForEach(file.badRanges, id: \.self) { range in
+                            Text(
+                                "Offset \(Formatting.hex(range.offset)) (\(range.offset) bytes), "
+                                    + "length \(Formatting.hex(range.length)) (\(range.length) bytes)"
+                            )
+                            .font(.caption.monospaced())
+                        }
+                    }
+                }
+            }
+            ForEach(report.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+            Spacer()
+        }
+        .padding(24)
+        .frame(width: 600, height: 460)
+    }
+
+    private var verdict: String {
+        switch report.verdict {
+        case .genuine: return "This drive looks genuine."
+        case .fakeCapacitySuspected: return "Fake capacity suspected."
+        case .failing: return "The drive is failing."
+        case .inconclusive: return "The test was inconclusive."
         }
     }
 }

@@ -61,6 +61,28 @@ enum FormatRetryPolicy {
     }
 }
 
+struct FormatPartition: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let size: Int64
+    let filesystem: String
+}
+
+enum FormatPresentation {
+    static func partitions(for volume: Volume, among volumes: [Volume]) -> [FormatPartition] {
+        volumes
+            .filter { $0.wholeDiskBSDName == volume.wholeDiskBSDName }
+            .map {
+                FormatPartition(
+                    id: $0.id.uuid,
+                    name: $0.name,
+                    size: $0.totalBytes,
+                    filesystem: $0.filesystem.displayName)
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
 struct FormatCoordinator: Sendable {
     let volumeControl: any VolumeControl
 

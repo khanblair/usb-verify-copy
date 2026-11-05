@@ -32,7 +32,7 @@ struct JobRow: View {
                 Image(systemName: iconName)
                     .foregroundStyle(statusColor)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(job.files.first?.finalName ?? "Copy job").font(.headline)
+                    Text(title).font(.headline)
                     Text(detailText).font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -41,7 +41,7 @@ struct JobRow: View {
                         .buttonStyle(.borderedProminent)
                 }
             }
-            if let snapshot = model.snapshots["active"], snapshot.fileCount > 0 {
+            if let snapshot = model.snapshots[job.id], snapshot.fileCount > 0 {
                 ProgressView(value: Double(snapshot.fileBytesDone), total: Double(max(snapshot.fileBytesTotal, 1)))
                     .tint(.accentColor)
                 HStack {
@@ -52,6 +52,11 @@ struct JobRow: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            }
+        }
+        ForEach(job.files.indices, id: \.self) { index in
+            if let result = job.files[index].result {
+                ResultLine(name: job.files[index].finalName, result: result)
             }
         }
         .padding(.vertical, 8)
@@ -72,5 +77,41 @@ struct JobRow: View {
         }
         let done = job.files.filter { $0.result != nil }.count
         return "\(done) of \(job.files.count) files complete · \(job.mode == .strict ? "Strict" : "Quick")"
+    }
+
+    private var title: String {
+        switch job.kind {
+        case .copy: return job.files.first?.finalName ?? "Copy job"
+        case .verifyOnly: return "Verify-only job"
+        case .capacityTest: return "Capacity test"
+        case .format: return "Format drive"
+        }
+    }
+}
+
+private struct ResultLine: View {
+    let name: String
+    let result: FileResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            switch result {
+            case .passed:
+                Label("PASS · \(name)", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            case .failed(_, let ranges):
+                Label("FAIL · \(name)", systemImage: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                ForEach(ranges, id: \.self) { range in
+                    Text("Bad range \(Formatting.hex(range.offset)) (\(range.offset) bytes)")
+                        .font(.caption.monospaced())
+                }
+            case .skipped(let reason):
+                Text("SKIPPED · \(reason)").foregroundStyle(.secondary)
+            case .cancelled:
+                Text("CANCELLED").foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
     }
 }

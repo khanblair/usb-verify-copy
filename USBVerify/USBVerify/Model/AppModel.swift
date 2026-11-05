@@ -35,10 +35,14 @@ final class AppModel {
     var capacityRequest: CapacityRequest?
     var showingCapacitySheet = false
     var capacityReport: CapacityReport?
+    var showingCapacityReport = false
+    var formatRetryRequest: FormatRequest?
+    var formatOutput: String?
     var pendingCleanup: CleanupConfirmation?
 
     private var cleanupFlags: [String: Bool] = [:]
     private var verifyTasks: [String: Task<Void, Never>] = [:]
+    private var pendingWholeDriveCapacity: CapacityRequest?
 
     private var volumeObserverStarted = false
     private var wakeObserverStarted = false
@@ -144,36 +148,12 @@ final class AppModel {
                 phase: .queued)
         }
         let job = PersistedJob(kind: .verifyOnly, mode: .quick, volumeID: request.volume.id, files: states)
-        jobs.append(job)
         showingVerifyOnlySheet = false
         selectedRoute = .jobs
-        let runner = VerifyOnlyRunner(
-            items: items,
-            volume: request.volume,
-            io: dependencies.driveIO,
-            volumeControl: dependencies.volumeControl,
-            sink: dependencies.runSink,
-            environment: RunEnvironment(route: request.volume.route))
+        coordinator.startVerifyOnly(job, volume: request.volume, items: items)
         let jobID = job.id
-        verifyTasks[jobID] = Task { [weak self] in
-            guard let self else { return }
-            for await event in runner.events { self.apply(event, to: jobID) }
-        }
-        Task { [weak self] in
-            let results = await runner.run()
-            guard let self else { return }
-            if let index = self.jobs.firstIndex(where: { $0.id == jobID }) {
-                for (fileIndex, result) in results.enumerated() {
-                    self.jobs[index].files[fileIndex].result = result
-                    self.jobs[index].files[fileIndex].phase = result.isPass ? .passed : .failed
-                    self.jobs[index].files[fileIndex].badRanges = result.badRanges
-                }
-                self.jobs[index].currentIndex = results.count
-                self.jobs[index].updatedAt = Date()
-            }
-            self.verifyTasks.removeValue(forKey: jobID)
-            await self.reloadHistory()
-        }
+        observeJobEvents(for: jobID)
+        jobs = coordinator.jobs
     }
 
     func presentFormatSheet(for volume: Volume) {
@@ -196,41 +176,56 @@ final class AppModel {
             show(error: VerifyError.formatRefused(reason: "Type the drive BSD id or its non-generic name."))
             return
         }
-        let busy = Set(jobs.filter { $0.pausedReason != nil || !isFinished($0) }.map(\.volumeID))
-        let fresh = volumes.first(where: { $0.id == request.volume.id })
-        Task { [dependencies] in
-            do {
-                let coordinator = FormatCoordinator(volumeControl: dependencies.volumeControl)
-                _ = try await coordinator.erase(
-                    confirmed: request.volume,
-                    fresh: fresh,
-                    busyVolumes: busy,
-                    label: request.label,
-                    useAdminAfterPermissionFailure: useAdminAfterPermissionFailure)
-            } catch {
-                await MainActor.run { self.show(error: error) }
-            }
-        }
+        let state = FileJobState(
+            sourcePath: "",
+            destinationFolder: "",
+            finalName: "Format \(request.volume.name)",
+            tempName: "",
+            chunkSize: Defaults.chunkSize,
+            sourceIdentity: FileIdentity(size: 0, modifiedTimeNs: 0, inode: 0))
+        let job = PersistedJob(
+            kind: .format,
+            mode: .quick,
+            volumeID: request.volume.id,
+            files: [state])
+        coordinator.startFormat(
+            job,
+            volume: request.volume,
+            label: request.label,
+            useAdmin: useAdminAfterPermissionFailure)
+        jobs = coordinator.jobs
+        observeJobEvents(for: job.id)
         showingFormatSheet = false
     }
 
     func startCapacity(_ request: CapacityRequest) {
-        guard request.mode == .freeSpaceOnly else {
+        if request.mode == .wholeDrive {
+            pendingWholeDriveCapacity = request
             presentFormatSheet(for: request.volume)
             return
         }
         showingCapacitySheet = false
-        Task { [dependencies] in
-            let runner = CapacityRunner(
-                volume: request.volume,
-                config: request.config,
-                io: dependencies.driveIO,
-                volumeControl: dependencies.volumeControl,
-                sink: dependencies.runSink,
-                environment: RunEnvironment(route: request.volume.route))
-            let report = await runner.run()
-            await MainActor.run { self.capacityReport = report }
-        }
+        let state = FileJobState(
+            sourcePath: "",
+            destinationFolder: request.config.folder,
+            finalName: "Capacity test",
+            tempName: "",
+            chunkSize: Defaults.chunkSize,
+            sourceIdentity: FileIdentity(size: request.volume.freeBytes, modifiedTimeNs: 0, inode: 0))
+        let job = PersistedJob(
+            kind: .capacityTest,
+            mode: .quick,
+            volumeID: request.volume.id,
+            files: [state])
+        coordinator.startCapacity(job, volume: request.volume, config: request.config)
+        jobs = coordinator.jobs
+        observeJobEvents(for: job.id)
+    }
+
+    func confirmFormatRetry() {
+        guard let request = formatRetryRequest else { return }
+        formatRetryRequest = nil
+        startFormat(request, useAdminAfterPermissionFailure: true)
     }
 
     func confirmCleanup() {
@@ -331,12 +326,30 @@ final class AppModel {
         switch event {
         case .progress(let snapshot): snapshots[jobID] = snapshot
         case .phase(let fileIndex, let phase): phases["\(jobID):\(fileIndex)"] = phase
-        case .warning(let warning): warnings[jobID, default: []].append(warning)
+        case .warning(let warning):
+            warnings[jobID, default: []].append(warning)
+            if warning.lowercased().contains("permission") {
+                formatRetryRequest = formatRequest
+                formatOutput = warning
+            }
         case .waitingForUnmount(let blockers): waitingForUnmount[jobID] = blockers
         case .fileFinished(let index, let result): fileResults[jobID, default: [:]][index] = result
         case .paused, .finished:
             jobs = coordinator.jobs
             if case .finished = event {
+                capacityReport = coordinator.latestCapacityReport
+                showingCapacityReport = coordinator.latestCapacityReport != nil
+                if let job = jobs.first(where: { $0.id == jobID }),
+                    job.kind == .format,
+                    let pending = pendingWholeDriveCapacity
+                {
+                    pendingWholeDriveCapacity = nil
+                    startCapacity(
+                        CapacityRequest(
+                            volume: pending.volume,
+                            mode: .freeSpaceOnly,
+                            config: pending.config))
+                }
                 offerCleanupIfNeeded(jobID: jobID)
                 Task { await reloadHistory() }
             }

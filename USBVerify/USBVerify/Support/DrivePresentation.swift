@@ -47,6 +47,21 @@ enum DrivePresentation {
 }
 
 enum MenuBarPresentation {
+    static func status(for state: MenuBarState) -> String {
+        switch state {
+        case .idle:
+            return "Idle"
+        case .working(let percent):
+            return percent.map { "Working \($0)%" } ?? "Working"
+        case .paused:
+            return "Paused"
+        case .passed:
+            return "PASS"
+        case .failed:
+            return "FAIL"
+        }
+    }
+
     static func status(
         snapshot: ProgressSnapshot?,
         phase: JobPhase?,
@@ -70,6 +85,14 @@ enum MenuBarPresentation {
         if hasActiveSnapshot { return "arrow.triangle.2.circlepath" }
         return "externaldrive"
     }
+}
+
+enum MenuBarState: Equatable {
+    case idle
+    case working(percent: Int?)
+    case paused
+    case passed
+    case failed
 }
 
 enum HistoryPresentation {

@@ -3,15 +3,26 @@ import USBVerifyCore
 
 @MainActor
 final class JobCoordinator {
+    enum Operation {
+        case copy
+        case verify(items: [VerifyOnlyItem])
+        case capacity(config: CapacityConfig)
+        case format(label: String, useAdmin: Bool)
+    }
+
     private struct QueuedRun {
         var job: PersistedJob
         var volume: Volume
+        var operation: Operation
     }
 
     private let dependencies: AppDependencies
     private var queue: [QueuedRun] = []
     private var runner: JobRunner?
     private var activeRun: Task<JobSummary, Never>?
+    private var activeOperationTask: Task<Void, Never>?
+    private var activeControl: JobControl?
+    private var activeJobIDValue: String?
     private var powerToken: (any PowerToken)?
     private var subscribers: [String: [AsyncStream<JobEvent>.Continuation]] = [:]
     private var savedRunners: [String: JobRunner] = [:]
@@ -20,8 +31,9 @@ final class JobCoordinator {
 
     var jobs: [PersistedJob] = []
     var snapshots: [String: ProgressSnapshot] = [:]
-    var isRunning: Bool { runner != nil }
-    var activeJobID: String? { runner?.currentJob.id }
+    var latestCapacityReport: CapacityReport?
+    var isRunning: Bool { activeJobIDValue != nil }
+    var activeJobID: String? { activeJobIDValue }
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -47,18 +59,69 @@ final class JobCoordinator {
 
     func start(_ job: PersistedJob, volume: Volume) {
         jobs.append(job)
-        queue.append(QueuedRun(job: job, volume: volume))
+        queue.append(QueuedRun(job: job, volume: volume, operation: .copy))
+        startNextIfNeeded()
+    }
+
+    func startVerifyOnly(
+        _ job: PersistedJob,
+        volume: Volume,
+        items: [VerifyOnlyItem]
+    ) {
+        jobs.append(job)
+        queue.append(QueuedRun(job: job, volume: volume, operation: .verify(items: items)))
+        startNextIfNeeded()
+    }
+
+    func startCapacity(_ job: PersistedJob, volume: Volume, config: CapacityConfig) {
+        jobs.append(job)
+        queue.append(QueuedRun(job: job, volume: volume, operation: .capacity(config: config)))
+        startNextIfNeeded()
+    }
+
+    func startFormat(
+        _ job: PersistedJob,
+        volume: Volume,
+        label: String,
+        useAdmin: Bool = false
+    ) {
+        jobs.append(job)
+        queue.append(
+            QueuedRun(
+                job: job,
+                volume: volume,
+                operation: .format(label: label, useAdmin: useAdmin)))
         startNextIfNeeded()
     }
 
     func resume(_ job: PersistedJob, volume: Volume) {
-        queue.append(QueuedRun(job: job, volume: volume))
+        queue.append(QueuedRun(job: job, volume: volume, operation: .copy))
         startNextIfNeeded()
     }
 
-    func requestPause(_ reason: PauseReason) { runner?.control.requestPause(reason) }
-    func requestCancel() { runner?.control.requestCancel() }
-    func retryUnmount() { runner?.control.requestUnmountRetry() }
+    func requestPause(_ reason: PauseReason) {
+        if let runner {
+            runner.control.requestPause(reason)
+        } else {
+            activeControl?.requestPause(reason)
+        }
+    }
+
+    func requestCancel() {
+        if let runner {
+            runner.control.requestCancel()
+        } else {
+            activeControl?.requestCancel()
+        }
+    }
+
+    func retryUnmount() {
+        if let runner {
+            runner.control.requestUnmountRetry()
+        } else {
+            activeControl?.requestUnmountRetry()
+        }
+    }
 
     func cancel(jobID: String, deletePartial: Bool) async {
         guard let active = runner, active.currentJob.id == jobID else { return }
@@ -74,7 +137,7 @@ final class JobCoordinator {
             let updated = oldRunner.currentJob
             guard let volume = knownVolumes[updated.volumeID] else { return }
             replaceJob(updated)
-            queue.insert(QueuedRun(job: updated, volume: volume), at: 0)
+            queue.insert(QueuedRun(job: updated, volume: volume, operation: .copy), at: 0)
             startNextIfNeeded()
         } catch {
             return
@@ -102,11 +165,31 @@ final class JobCoordinator {
     private func startNextIfNeeded() {
         guard runner == nil, let next = queue.first else { return }
         queue.removeFirst()
-        run(next.job, volume: next.volume)
+        run(next)
     }
 
-    private func run(_ job: PersistedJob, volume: Volume) {
+    private func run(_ queued: QueuedRun) {
+        let job = queued.job
+        let volume = queued.volume
         powerToken = dependencies.powerGuard.begin(reason: "USB Verify is checking a drive")
+        activeJobIDValue = job.id
+        run(queued.operation, job: job, volume: volume)
+    }
+
+    private func run(_ operation: Operation, job: PersistedJob, volume: Volume) {
+        switch operation {
+        case .copy:
+            runCopy(job, volume: volume)
+        case .verify(let items):
+            runVerify(items, job: job, volume: volume)
+        case .capacity(let config):
+            runCapacity(config, job: job, volume: volume)
+        case .format(let label, let useAdmin):
+            runFormat(label, useAdmin: useAdmin, job: job, volume: volume)
+        }
+    }
+
+    private func runCopy(_ job: PersistedJob, volume: Volume) {
         let newRunner = JobRunner(
             job: job,
             volume: volume,
@@ -130,6 +213,121 @@ final class JobCoordinator {
         }
     }
 
+    private func runVerify(
+        _ items: [VerifyOnlyItem],
+        job: PersistedJob,
+        volume: Volume
+    ) {
+        let verifyRunner = VerifyOnlyRunner(
+            items: items,
+            volume: volume,
+            io: dependencies.driveIO,
+            volumeControl: dependencies.volumeControl,
+            sink: dependencies.runSink,
+            environment: RunEnvironment(route: volume.route))
+        activeControl = verifyRunner.control
+        activeOperationTask = Task { [weak self, weak verifyRunner] in
+            guard let self, let verifyRunner else { return }
+            for await event in verifyRunner.events { publish(event, for: job.id) }
+        }
+        Task { [weak self, weak verifyRunner] in
+            guard let self, let verifyRunner else { return }
+            let results = await verifyRunner.run()
+            finishVerify(results, job: job)
+        }
+    }
+
+    private func runCapacity(
+        _ config: CapacityConfig,
+        job: PersistedJob,
+        volume: Volume
+    ) {
+        let capacityRunner = CapacityRunner(
+            volume: volume,
+            config: config,
+            io: dependencies.driveIO,
+            volumeControl: dependencies.volumeControl,
+            sink: dependencies.runSink,
+            environment: RunEnvironment(route: volume.route))
+        activeControl = capacityRunner.control
+        activeOperationTask = Task { [weak self, weak capacityRunner] in
+            guard let self, let capacityRunner else { return }
+            for await event in capacityRunner.events { publish(event, for: job.id) }
+        }
+        Task { [weak self, weak capacityRunner] in
+            guard let self, let capacityRunner else { return }
+            latestCapacityReport = await capacityRunner.run()
+            finishSimple(job: job)
+        }
+    }
+
+    private func runFormat(
+        _ label: String,
+        useAdmin: Bool,
+        job: PersistedJob,
+        volume: Volume
+    ) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let fresh = knownVolumes[volume.id]
+                let busy = Set(
+                    jobs
+                        .filter { $0.id != job.id && !isFinished($0) }
+                        .map(\.volumeID))
+                let coordinator = FormatCoordinator(volumeControl: dependencies.volumeControl)
+                _ = try await coordinator.erase(
+                    confirmed: volume,
+                    fresh: fresh,
+                    busyVolumes: busy,
+                    label: label,
+                    useAdminAfterPermissionFailure: useAdmin)
+            } catch {
+                publish(.warning(String(describing: error)), for: job.id)
+            }
+            finishSimple(job: job)
+        }
+    }
+
+    private func finishVerify(_ results: [FileResult], job: PersistedJob) {
+        var updated = job
+        for (index, result) in results.enumerated() where updated.files.indices.contains(index) {
+            updated.files[index].result = result
+            switch result {
+            case .passed:
+                updated.files[index].phase = .passed
+            case .failed(_, let ranges):
+                updated.files[index].phase = .failed
+                updated.files[index].badRanges = ranges
+            case .skipped, .cancelled:
+                updated.files[index].phase = .failed
+            }
+        }
+        updated.currentIndex = results.count
+        replaceJob(updated)
+        finishActive(jobID: job.id)
+    }
+
+    private func finishSimple(job: PersistedJob) {
+        var updated = job
+        for index in updated.files.indices {
+            updated.files[index].result = .passed(sourceHash: "", rereadHash: "")
+            updated.files[index].phase = .passed
+        }
+        replaceJob(updated)
+        finishActive(jobID: job.id)
+    }
+
+    private func finishActive(jobID: String) {
+        powerToken?.end()
+        powerToken = nil
+        activeControl = nil
+        activeOperationTask = nil
+        activeJobIDValue = nil
+        completionWaiters.removeValue(forKey: jobID)?.forEach { $0.resume() }
+        startNextIfNeeded()
+    }
+
     private func finish(summary: JobSummary, runner: JobRunner) {
         powerToken?.end()
         powerToken = nil
@@ -146,6 +344,7 @@ final class JobCoordinator {
         }
         savedRunners[summary.job.id] = runner
         self.runner = nil
+        activeJobIDValue = nil
         activeRun = nil
         completionWaiters.removeValue(forKey: summary.job.id)?.forEach { $0.resume() }
         startNextIfNeeded()
