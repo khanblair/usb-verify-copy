@@ -20,7 +20,7 @@ let package = Package(
                 .linkedFramework("UserNotifications"),
             ]
         ),
-        .testTarget(name: "USBVerifyCoreTests", dependencies: ["USBVerifyCore"]),
+        .testTarget(name: "USBVerifyCoreTests", dependencies: ["USBVerifyCore", "USBVerifySystem"]),
         .testTarget(name: "USBVerifySystemTests", dependencies: ["USBVerifySystem", "USBVerifyCore"]),
     ]
 )
