@@ -3,13 +3,13 @@ import Testing
 
 @testable import USBVerifyCore
 
-private let testChunkSize = 4 * Defaults.alignment
+let testChunkSize = 4 * Defaults.alignment
 
-private final class ClockBox: @unchecked Sendable {
+final class ClockBox: @unchecked Sendable {
     var value = 0.0
 }
 
-private func testClock(step: Double = 0.01) -> EngineClock {
+func testClock(step: Double = 0.01) -> EngineClock {
     let box = ClockBox()
     return EngineClock(
         now: {
@@ -19,7 +19,7 @@ private func testClock(step: Double = 0.01) -> EngineClock {
         sleep: { _ in await Task.yield() })
 }
 
-private struct CopyHarness {
+struct CopyHarness {
     let drive: FakeDrive
     let volume: Volume
     let control: FakeVolumeControl
@@ -31,7 +31,7 @@ private struct CopyHarness {
     let store: JobStore
 }
 
-private func makeHarness(data: [UInt8], name: String = "copy.bin", mode: VerifyMode = .strict) throws -> (
+func makeHarness(data: [UInt8], name: String = "copy.bin", mode: VerifyMode = .strict) throws -> (
     CopyHarness, JobRunner
 ) {
     let mount = "/Volumes/Test"
@@ -60,7 +60,7 @@ private func makeHarness(data: [UInt8], name: String = "copy.bin", mode: VerifyM
     )
 }
 
-private func collect(_ stream: AsyncStream<JobEvent>) async -> [JobEvent] {
+func collect(_ stream: AsyncStream<JobEvent>) async -> [JobEvent] {
     var events: [JobEvent] = []
     for await event in stream {
         events.append(event)
@@ -68,7 +68,7 @@ private func collect(_ stream: AsyncStream<JobEvent>) async -> [JobEvent] {
     return events
 }
 
-private func run(_ runner: JobRunner) async -> (JobSummary, [JobEvent]) {
+func run(_ runner: JobRunner) async -> (JobSummary, [JobEvent]) {
     async let summary = runner.run()
     let events = await collect(runner.events)
     return (await summary, events)
@@ -100,7 +100,7 @@ func copyPassesInBothModes(_ mode: VerifyMode) async throws {
         events.firstIndex(of: .fileFinished(fileIndex: 0, summary.results[0]!))! > phases.firstIndex(of: .remounting)!)
 }
 
-private func summaryHash(_ data: [UInt8]) -> String {
+func summaryHash(_ data: [UInt8]) -> String {
     data.withUnsafeBytes { StreamingHasher.hash(of: $0) }
 }
 
