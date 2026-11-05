@@ -157,8 +157,7 @@ final class JobCoordinator {
     }
 
     private func replaceJob(_ job: PersistedJob) {
-        if let index = jobs.firstIndex(where: { $0.id == job.id }) { jobs[index] = job }
-        else { jobs.append(job) }
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) { jobs[index] = job } else { jobs.append(job) }
     }
 
     private func isFinished(_ job: PersistedJob) -> Bool { job.files.allSatisfy { $0.result != nil } }

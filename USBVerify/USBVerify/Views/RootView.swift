@@ -33,6 +33,18 @@ struct RootView: View {
         .sheet(isPresented: $model.showingCopySheet) {
             CopySheet(model: model)
         }
+        .sheet(isPresented: $model.showingVerifyOnlySheet) {
+            VerifyOnlySheet(model: model)
+        }
+        .sheet(isPresented: $model.showingFormatSheet) {
+            FormatSheet(model: model)
+        }
+        .sheet(isPresented: $model.showingCapacitySheet) {
+            CapacitySheet(model: model)
+        }
+        .sheet(item: $model.pendingCleanup) { confirmation in
+            CleanupConfirmationSheet(model: model, confirmation: confirmation)
+        }
     }
 }
 
@@ -88,7 +100,11 @@ struct DriveDetailView: View {
                 HStack {
                     Button("Copy files") { model.presentCopySheet(for: volume) }
                         .buttonStyle(.borderedProminent)
-                    Button("Verify only") { model.presentCopySheet(for: volume) }
+                    Button("Verify only") { model.presentVerifyOnlySheet(for: volume) }
+                        .buttonStyle(.bordered)
+                    Button("Format…") { model.presentFormatSheet(for: volume) }
+                        .buttonStyle(.bordered)
+                    Button("Capacity test…") { model.presentCapacitySheet(for: volume) }
                         .buttonStyle(.bordered)
                     Button("Eject") { model.eject(volume: volume) }
                         .buttonStyle(.bordered)

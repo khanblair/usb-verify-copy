@@ -28,6 +28,17 @@ final class AppModel {
     var preflightIssues: [(message: String, detail: String)] = []
     var resumableJobIDs: Set<String> = []
     var reconnectMessages: [String: String] = [:]
+    var verifyOnlyRequest: VerifyOnlyRequest?
+    var showingVerifyOnlySheet = false
+    var formatRequest: FormatRequest?
+    var showingFormatSheet = false
+    var capacityRequest: CapacityRequest?
+    var showingCapacitySheet = false
+    var capacityReport: CapacityReport?
+    var pendingCleanup: CleanupConfirmation?
+
+    private var cleanupFlags: [String: Bool] = [:]
+    private var verifyTasks: [String: Task<Void, Never>] = [:]
 
     private var volumeObserverStarted = false
     private var wakeObserverStarted = false
@@ -41,12 +52,27 @@ final class AppModel {
     }
 
     var menuBarStatus: String {
-        guard let snapshot = snapshots.values.first else { return "Idle" }
-        guard snapshot.fileBytesTotal > 0 else { return "Copying" }
-        return "Copying \(Int(snapshot.fileBytesDone * 100 / snapshot.fileBytesTotal))%"
+        let jobID = coordinator.activeJobID
+        let snapshot = jobID.flatMap { snapshots[$0] }
+        let phase = jobID.flatMap { phases["\($0):\(snapshot?.fileIndex ?? 0)"] }
+        return MenuBarPresentation.status(
+            snapshot: snapshot,
+            phase: phase,
+            mostRecentResult: jobs.last.flatMap { job in
+                job.files.last?.result.map { result in
+                    if case .passed = result { return "PASS" }
+                    if case .failed = result { return "FAIL" }
+                    return nil
+                } ?? nil
+            } ?? nil)
     }
 
-    var menuBarSymbol: String { snapshots.isEmpty ? "externaldrive" : "arrow.triangle.2.circlepath" }
+    var menuBarSymbol: String {
+        let jobID = coordinator.activeJobID
+        let snapshot = jobID.flatMap { snapshots[$0] }
+        let phase = jobID.flatMap { phases["\($0):\(snapshot?.fileIndex ?? 0)"] }
+        return MenuBarPresentation.symbol(phase: phase, hasActiveSnapshot: snapshot != nil)
+    }
 
     func refresh() async {
         volumes = await dependencies.volumeEvents.currentVolumes()
@@ -74,6 +100,7 @@ final class AppModel {
                 return
             }
             coordinator.start(planned.job, volume: request.volume)
+            cleanupFlags[planned.job.id] = request.removeDotFilesAfter
             isOnBattery = dependencies.powerGuard.isOnBattery
             jobs = coordinator.jobs
             observeJobEvents(for: planned.job.id)
@@ -86,9 +113,139 @@ final class AppModel {
         }
     }
 
+    func presentVerifyOnlySheet(for volume: Volume? = nil) {
+        selectedVolume = volume ?? selectedVolume ?? volumes.first
+        verifyOnlyRequest = selectedVolume.map {
+            VerifyOnlyRequest(volume: $0, sourcePaths: [], destinationFolder: "")
+        }
+        showingVerifyOnlySheet = selectedVolume != nil
+    }
+
+    func startVerifyOnly(_ request: VerifyOnlyRequest) {
+        let names = Set(
+            FileManager.default.enumerator(atPath: request.volume.mountPath)?.compactMap { value in
+                (value as? String).map { URL(fileURLWithPath: $0).lastPathComponent }
+            } ?? [])
+        let matches = VerifyOnlyPlanner.matches(
+            sourcePaths: request.sourcePaths,
+            destinationFolder: request.destinationFolder,
+            driveNames: names)
+        let items = matches.filter(\.isMatched).map {
+            VerifyOnlyItem(sourcePath: $0.sourcePath, destinationFolder: $0.destinationFolder, name: $0.name)
+        }
+        let states = items.map { item in
+            FileJobState(
+                sourcePath: item.sourcePath,
+                destinationFolder: item.destinationFolder,
+                finalName: item.name,
+                tempName: item.name,
+                chunkSize: Defaults.chunkSize,
+                sourceIdentity: FileIdentity(size: 0, modifiedTimeNs: 0, inode: 0),
+                phase: .queued)
+        }
+        let job = PersistedJob(kind: .verifyOnly, mode: .quick, volumeID: request.volume.id, files: states)
+        jobs.append(job)
+        showingVerifyOnlySheet = false
+        selectedRoute = .jobs
+        let runner = VerifyOnlyRunner(
+            items: items,
+            volume: request.volume,
+            io: dependencies.driveIO,
+            volumeControl: dependencies.volumeControl,
+            sink: dependencies.runSink,
+            environment: RunEnvironment(route: request.volume.route))
+        let jobID = job.id
+        verifyTasks[jobID] = Task { [weak self] in
+            guard let self else { return }
+            for await event in runner.events { self.apply(event, to: jobID) }
+        }
+        Task { [weak self] in
+            let results = await runner.run()
+            guard let self else { return }
+            if let index = self.jobs.firstIndex(where: { $0.id == jobID }) {
+                for (fileIndex, result) in results.enumerated() {
+                    self.jobs[index].files[fileIndex].result = result
+                    self.jobs[index].files[fileIndex].phase = result.isPass ? .passed : .failed
+                    self.jobs[index].files[fileIndex].badRanges = result.badRanges
+                }
+                self.jobs[index].currentIndex = results.count
+                self.jobs[index].updatedAt = Date()
+            }
+            self.verifyTasks.removeValue(forKey: jobID)
+            await self.reloadHistory()
+        }
+    }
+
+    func presentFormatSheet(for volume: Volume) {
+        formatRequest = FormatRequest(volume: volume)
+        showingFormatSheet = true
+    }
+
+    func presentCapacitySheet(for volume: Volume) {
+        capacityRequest = CapacityRequest(volume: volume)
+        showingCapacitySheet = true
+    }
+
+    func startFormat(_ request: FormatRequest, useAdminAfterPermissionFailure: Bool = false) {
+        guard
+            FormatPlan.confirmationMatches(
+                typed: request.confirmation,
+                volume: request.volume,
+                otherNames: volumes.map(\.name))
+        else {
+            show(error: VerifyError.formatRefused(reason: "Type the drive BSD id or its non-generic name."))
+            return
+        }
+        let busy = Set(jobs.filter { $0.pausedReason != nil || !isFinished($0) }.map(\.volumeID))
+        let fresh = volumes.first(where: { $0.id == request.volume.id })
+        Task { [dependencies] in
+            do {
+                let coordinator = FormatCoordinator(volumeControl: dependencies.volumeControl)
+                _ = try await coordinator.erase(
+                    confirmed: request.volume,
+                    fresh: fresh,
+                    busyVolumes: busy,
+                    label: request.label,
+                    useAdminAfterPermissionFailure: useAdminAfterPermissionFailure)
+            } catch {
+                await MainActor.run { self.show(error: error) }
+            }
+        }
+        showingFormatSheet = false
+    }
+
+    func startCapacity(_ request: CapacityRequest) {
+        guard request.mode == .freeSpaceOnly else {
+            presentFormatSheet(for: request.volume)
+            return
+        }
+        showingCapacitySheet = false
+        Task { [dependencies] in
+            let runner = CapacityRunner(
+                volume: request.volume,
+                config: request.config,
+                io: dependencies.driveIO,
+                volumeControl: dependencies.volumeControl,
+                sink: dependencies.runSink,
+                environment: RunEnvironment(route: request.volume.route))
+            let report = await runner.run()
+            await MainActor.run { self.capacityReport = report }
+        }
+    }
+
+    func confirmCleanup() {
+        guard let pendingCleanup else { return }
+        _ = DotCleaner.delete(pendingCleanup.paths, within: pendingCleanup.root)
+        self.pendingCleanup = nil
+    }
+
+    func cancelCleanup() {
+        pendingCleanup = nil
+    }
+
     func resume(jobID: String) {
         guard let job = jobs.first(where: { $0.id == jobID }),
-              let volume = volumes.first(where: { $0.id == job.volumeID })
+            let volume = volumes.first(where: { $0.id == job.volumeID })
         else { return }
         coordinator.resume(job, volume: volume)
         isOnBattery = dependencies.powerGuard.isOnBattery
@@ -137,8 +294,11 @@ final class AppModel {
             switch event {
             case .added(let volume), .changed(let volume):
                 let wasAbsent = !volumes.contains { $0.id == volume.id }
-                if let index = volumes.firstIndex(where: { $0.id == volume.id }) { volumes[index] = volume }
-                else { volumes.append(volume) }
+                if let index = volumes.firstIndex(where: { $0.id == volume.id }) {
+                    volumes[index] = volume
+                } else {
+                    volumes.append(volume)
+                }
                 coordinator.setCurrentVolumes(volumes)
                 if wasAbsent { announceDriveBack(volume) }
             case .removed(let id):
@@ -177,6 +337,7 @@ final class AppModel {
         case .paused, .finished:
             jobs = coordinator.jobs
             if case .finished = event {
+                offerCleanupIfNeeded(jobID: jobID)
                 Task { await reloadHistory() }
             }
         }
@@ -194,8 +355,11 @@ final class AppModel {
     }
 
     private func updateResumableState(for job: PersistedJob) {
-        if volumes.contains(where: { $0.id == job.volumeID }) { resumableJobIDs.insert(job.id) }
-        else { reconnectMessages[job.id] = "Reconnect the drive" }
+        if volumes.contains(where: { $0.id == job.volumeID }) {
+            resumableJobIDs.insert(job.id)
+        } else {
+            reconnectMessages[job.id] = "Reconnect the drive"
+        }
     }
 
     private func clearRemovedSelection() {
@@ -225,5 +389,39 @@ final class AppModel {
     private func reloadHistory() async {
         history = (try? await dependencies.historyStore.loadAll()) ?? []
         routeSummaries = RouteHistory.summaries(from: history)
+    }
+
+    private func isFinished(_ job: PersistedJob) -> Bool {
+        job.files.allSatisfy { $0.result != nil }
+    }
+
+    private func offerCleanupIfNeeded(jobID: String) {
+        guard cleanupFlags[jobID] == true,
+            let job = jobs.first(where: { $0.id == jobID }),
+            job.files.allSatisfy({
+                if case .passed = $0.result { return true }
+                return false
+            })
+        else { return }
+        let paths = job.files.flatMap { file -> [String] in
+            let root = [volumes.first(where: { $0.id == job.volumeID })?.mountPath, file.destinationFolder]
+                .compactMap { $0 }.joined(separator: "/")
+            return DotCleaner.scan(root: root)
+        }
+        if let root = volumes.first(where: { $0.id == job.volumeID })?.mountPath, !paths.isEmpty {
+            pendingCleanup = CleanupConfirmation(root: root, paths: paths)
+        }
+    }
+}
+
+extension FileResult {
+    fileprivate var isPass: Bool {
+        if case .passed = self { return true }
+        return false
+    }
+
+    fileprivate var badRanges: [BadRange] {
+        if case .failed(_, let ranges) = self { return ranges }
+        return []
     }
 }
