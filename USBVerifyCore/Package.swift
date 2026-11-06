@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "USBVerifyCore", targets: ["USBVerifyCore"]),
         .library(name: "USBVerifySystem", targets: ["USBVerifySystem"]),
+        .executable(name: "usbverify", targets: ["usbverify"]),
     ],
     targets: [
         .target(name: "USBVerifyCore"),
@@ -20,6 +21,10 @@ let package = Package(
                 .linkedFramework("UserNotifications"),
             ]
         ),
+        // Command-line front end for the same engine the app uses.
+        .target(name: "USBVerifyCLI", dependencies: ["USBVerifyCore", "USBVerifySystem"]),
+        .executableTarget(name: "usbverify", dependencies: ["USBVerifyCLI"]),
+        .testTarget(name: "USBVerifyCLITests", dependencies: ["USBVerifyCLI", "USBVerifyCore"]),
         .testTarget(name: "USBVerifyCoreTests", dependencies: ["USBVerifyCore", "USBVerifySystem"]),
         .testTarget(name: "USBVerifySystemTests", dependencies: ["USBVerifySystem", "USBVerifyCore"]),
     ]
