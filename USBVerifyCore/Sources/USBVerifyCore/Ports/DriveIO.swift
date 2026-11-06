@@ -33,4 +33,11 @@ public protocol DriveIO: Sendable {
     func rename(from: String, to: String) throws
     func removeFile(path: String) throws
     func freeSpace(path: String) throws -> Int64
+    /// Creates the folder and any missing parents. Succeeds when it already exists.
+    func createDirectory(path: String) throws
+}
+
+extension DriveIO {
+    /// Test drives that keep files in memory have no real folders, so the default does nothing.
+    public func createDirectory(path: String) throws {}
 }

@@ -12,11 +12,14 @@ public final class DiskArbitrationVolumeEvents: VolumeEvents, @unchecked Sendabl
     private let session: DASession?
     private let context: Context
     private let connection: (any ConnectionInfoProvider)?
+    private let includeDiskImages: Bool
     private var known: [VolumeID: Volume] = [:]
     private var subscribers: [UUID: AsyncStream<VolumeEvent>.Continuation] = [:]
 
-    public init(connection: (any ConnectionInfoProvider)? = nil) {
+    /// `includeDiskImages` is for testing with a RAM disk only. Disk images are hidden by default.
+    public init(connection: (any ConnectionInfoProvider)? = nil, includeDiskImages: Bool = false) {
         self.connection = connection
+        self.includeDiskImages = includeDiskImages
         self.context = Context()
         self.session = DASessionCreate(kCFAllocatorDefault)
         context.owner = self
@@ -38,8 +41,29 @@ public final class DiskArbitrationVolumeEvents: VolumeEvents, @unchecked Sendabl
         continuations.forEach { $0.finish() }
     }
 
+    /// Scans the mounted volumes now, so the first call right after start-up already sees every drive.
+    /// The appeared callbacks fill the list later and on their own thread, which is too late for a one-shot caller.
     public func currentVolumes() async -> [Volume] {
-        snapshotVolumes()
+        await scanMountedVolumes()
+        return snapshotVolumes()
+    }
+
+    private func scanMountedVolumes() async {
+        guard let session else { return }
+        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []
+        for url in urls {
+            guard let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, url as CFURL),
+                let description = DADiskCopyDescription(disk) as? [String: Any],
+                let diskDescription = makeDescription(from: description, mountFacts: mountFacts(for: url.path))
+            else { continue }
+            let route = await connection?.route(
+                forWholeDisk: diskDescription.wholeDiskBSDName ?? diskDescription.bsdName)
+            guard
+                let volume = VolumeCatalog.makeVolume(
+                    from: diskDescription, route: route, allowDiskImages: includeDiskImages)
+            else { continue }
+            lock.withLock { known[volume.id] = volume }
+        }
     }
 
     public func events() -> AsyncStream<VolumeEvent> {
@@ -66,7 +90,10 @@ public final class DiskArbitrationVolumeEvents: VolumeEvents, @unchecked Sendabl
         Task { [weak self] in
             guard let self else { return }
             let route = await connection?.route(forWholeDisk: diskDescription.wholeDiskBSDName ?? bsdName)
-            guard let volume = VolumeCatalog.makeVolume(from: diskDescription, route: route) else { return }
+            guard
+                let volume = VolumeCatalog.makeVolume(
+                    from: diskDescription, route: route, allowDiskImages: includeDiskImages)
+            else { return }
             publish(volume: volume, kind: kind)
         }
     }
@@ -122,10 +149,4 @@ private func diskDescriptionChanged(_ disk: DADisk, _ keys: CFArray, _ context: 
     guard let context else { return }
     Unmanaged<DiskArbitrationVolumeEvents.Context>.fromOpaque(context).takeUnretainedValue().owner?.process(
         disk, kind: .changed)
-}
-
-private func uuidString(_ value: Any?) -> String? {
-    if let value = value as? UUID { return value.uuidString }
-    if let value = value as? NSUUID { return value.uuidString }
-    return value as? String
 }

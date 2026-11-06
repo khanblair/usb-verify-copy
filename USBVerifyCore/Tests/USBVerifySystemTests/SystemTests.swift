@@ -1,7 +1,8 @@
+import DiskArbitration
 import Foundation
 import Testing
 import USBVerifyCore
-import USBVerifySystem
+@testable import USBVerifySystem
 
 @Suite("USBVerifySystem")
 struct SystemTests {
@@ -269,4 +270,27 @@ private final class NameBox: @unchecked Sendable {
     let behindHub = makeRoute(chain: [drive, realHub, rootHub], protocolName: "USB")
     #expect(behindHub.hubInPath == true)
     #expect(behindHub.hubDepth == 1)
+}
+
+@Test func realDiskArbitrationUuidTypeIsConverted() {
+    // DiskArbitration hands over a CFUUID, not a Swift UUID or String.
+    let cfUUID = CFUUIDCreateFromString(kCFAllocatorDefault, "1612623E-D9A8-3D41-BC83-5E4C1AE4F53F" as CFString)!
+    #expect(uuidString(cfUUID) == "1612623E-D9A8-3D41-BC83-5E4C1AE4F53F")
+    #expect(
+        uuidString(UUID(uuidString: "1612623E-D9A8-3D41-BC83-5E4C1AE4F53F")!) == "1612623E-D9A8-3D41-BC83-5E4C1AE4F53F")
+    #expect(uuidString("ABC") == "ABC")
+    #expect(uuidString(nil) == nil)
+
+    let dict: [String: Any] = [
+        String(kDADiskDescriptionMediaBSDNameKey): "disk4s1",
+        String(kDADiskDescriptionVolumeUUIDKey): cfUUID,
+        String(kDADiskDescriptionVolumeNameKey): "Khan",
+        String(kDADiskDescriptionVolumeKindKey): "exfat",
+        String(kDADiskDescriptionVolumePathKey): URL(fileURLWithPath: "/Volumes/Khan"),
+        String(kDADiskDescriptionDeviceInternalKey): false,
+        String(kDADiskDescriptionDeviceProtocolKey): "USB",
+    ]
+    let description = makeDescription(from: dict, mountFacts: nil)
+    #expect(description?.volumeUUID == "1612623E-D9A8-3D41-BC83-5E4C1AE4F53F")
+    #expect(description.flatMap { VolumeCatalog.makeVolume(from: $0) }?.name == "Khan")
 }

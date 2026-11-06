@@ -66,3 +66,25 @@ extension DiskDescription {
         return copy
     }
 }
+
+@Test func diskImagesAreHiddenUnlessAllowedForTesting() {
+    // A RAM disk reports protocol "Virtual Interface" and has no "internal" key.
+    let image = DiskDescription(
+        volumeUUID: "UUID-IMG", volumeName: "USBVTEST", volumeKind: "exfat", volumePath: "/Volumes/USBVTEST",
+        bsdName: "disk9", deviceInternal: nil, protocolName: "Virtual Interface", totalBytes: 100, freeBytes: 50)
+    #expect(VolumeCatalog.makeVolume(from: image) == nil)
+    #expect(VolumeCatalog.makeVolume(from: image, allowDiskImages: true)?.name == "USBVTEST")
+
+    // The flag never lets an internal disk or the boot volume through.
+    var internalDisk = image
+    internalDisk.deviceInternal = true
+    internalDisk.protocolName = "Apple Fabric"
+    #expect(VolumeCatalog.makeVolume(from: internalDisk, allowDiskImages: true) == nil)
+    var boot = image
+    boot.isBootVolume = true
+    #expect(VolumeCatalog.makeVolume(from: boot, allowDiskImages: true) == nil)
+    // A real USB volume with a missing "internal" key stays hidden even with the flag.
+    var unknown = image
+    unknown.protocolName = "USB"
+    #expect(VolumeCatalog.makeVolume(from: unknown, allowDiskImages: true) == nil)
+}

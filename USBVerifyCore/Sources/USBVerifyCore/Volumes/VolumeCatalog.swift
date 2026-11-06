@@ -1,8 +1,13 @@
 public enum VolumeCatalog {
-    public static func makeVolume(from d: DiskDescription, route: Route? = nil) -> Volume? {
+    /// `allowDiskImages` is for testing with a RAM disk only. Disk images are hidden by default.
+    public static func makeVolume(from d: DiskDescription, route: Route? = nil, allowDiskImages: Bool = false)
+        -> Volume?
+    {
+        let isDiskImage = d.protocolName == "Virtual Interface"
+        // A disk image has no "internal" key at all, so it counts as external only when images are allowed.
+        let isExternal = d.deviceInternal == false || (allowDiskImages && isDiskImage && d.deviceInternal == nil)
         guard let uuid = d.volumeUUID, !uuid.isEmpty, let path = d.volumePath,
-            d.deviceInternal == false, !d.isBootVolume, !d.isNetwork,
-            d.protocolName != "Virtual Interface"
+            isExternal, !d.isBootVolume, !d.isNetwork, allowDiskImages || !isDiskImage
         else { return nil }
         return Volume(
             id: VolumeID(uuid), name: d.volumeName ?? "Untitled", mountPath: path,

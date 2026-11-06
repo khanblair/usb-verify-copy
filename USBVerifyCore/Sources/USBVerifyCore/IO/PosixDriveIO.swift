@@ -69,6 +69,15 @@ public final class PosixDriveIO: DriveIO, @unchecked Sendable {
         }
     }
 
+    public func createDirectory(path: String) throws {
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        } catch {
+            let code = (error as NSError).code == NSFileWriteNoPermissionError ? EACCES : EIO
+            throw mapError(operation: "mkdir", code: code, path: path, offset: 0)
+        }
+    }
+
     public func freeSpace(path: String) throws -> Int64 {
         var info = statfs()
         if path.withCString({ pointer in statfs(pointer, &info) }) != 0 {

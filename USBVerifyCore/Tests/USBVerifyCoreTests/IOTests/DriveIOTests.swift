@@ -114,3 +114,19 @@ func posixErrorMappingCoversKnownAndUnknownErrors() {
     #expect(drive.mapError(operation: "read", code: EIO, path: "x", offset: 4) == .driveDisconnected(atOffset: 4))
     #expect(drive.mapError(operation: "read", code: 12345, path: "x", offset: 4) == .io(operation: "read", code: 12345))
 }
+
+@Test func posixCreateDirectoryMakesNestedFoldersAndIsRepeatable() throws {
+    let base = NSTemporaryDirectory() + "mkdir-test-\(UUID().uuidString)"
+    defer { try? FileManager.default.removeItem(atPath: base) }
+    let io = PosixDriveIO()
+    let nested = base + "/a/b/c"
+    try io.createDirectory(path: nested)
+    var isDirectory: ObjCBool = false
+    #expect(FileManager.default.fileExists(atPath: nested, isDirectory: &isDirectory) && isDirectory.boolValue)
+    // A second call on an existing folder must succeed.
+    try io.createDirectory(path: nested)
+    // A copy into a folder that did not exist before now works end to end.
+    let writer = try io.createWriter(path: nested + "/file.bin", truncate: true)
+    try writer.close()
+    #expect(io.fileSize(path: nested + "/file.bin") == 0)
+}

@@ -91,7 +91,14 @@ private func int64Value(_ value: Any?) -> Int64 {
     return 0
 }
 
-private func uuidString(_ value: Any?) -> String? {
+/// DiskArbitration returns the volume UUID as a `CFUUID`, which Swift does not bridge to `UUID` or `NSUUID`.
+/// Without this conversion every real volume would have no UUID and would be hidden.
+func uuidString(_ value: Any?) -> String? {
+    guard let value else { return nil }
+    if CFGetTypeID(value as CFTypeRef) == CFUUIDGetTypeID() {
+        let cfUUID = unsafeBitCast(value as CFTypeRef, to: CFUUID.self)
+        return CFUUIDCreateString(kCFAllocatorDefault, cfUUID) as String?
+    }
     if let value = value as? UUID { return value.uuidString }
     if let value = value as? NSUUID { return value.uuidString }
     return stringValue(value)

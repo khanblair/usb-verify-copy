@@ -26,10 +26,12 @@ final class FileCopier {
     private var cacheWarned = false
     private var phase: JobPhase = .copying
 
-    init(fileIndex: Int, fileCount: Int, state: FileJobState, mode: VerifyMode, volume: Volume,
-         io: any DriveIO, volumeControl: any VolumeControl, clock: EngineClock, control: JobControl,
-         batchBytesBefore: Int64, batchBytesTotal: Int64,
-         emit: @escaping @Sendable (JobEvent) -> Void, persist: @escaping @Sendable (FileJobState) -> Void) {
+    init(
+        fileIndex: Int, fileCount: Int, state: FileJobState, mode: VerifyMode, volume: Volume,
+        io: any DriveIO, volumeControl: any VolumeControl, clock: EngineClock, control: JobControl,
+        batchBytesBefore: Int64, batchBytesTotal: Int64,
+        emit: @escaping @Sendable (JobEvent) -> Void, persist: @escaping @Sendable (FileJobState) -> Void
+    ) {
         self.fileIndex = fileIndex
         self.fileCount = fileCount
         self.state = state
@@ -100,7 +102,9 @@ final class FileCopier {
         for index in 0..<startIndex {
             let length = plan.length(of: index)
             currentOffset = plan.offset(of: index)
-            let read = try ChunkIO.readSource(source, into: bufferA, offset: currentOffset, length: length) { _ in try self.checkInterrupt() }
+            let read = try ChunkIO.readSource(source, into: bufferA, offset: currentOffset, length: length) { _ in
+                try self.checkInterrupt()
+            }
             if read != length { throw VerifyError.sourceChanged }
             sourceHasher.update(bufferA.bytes(count: length))
         }
@@ -109,6 +113,7 @@ final class FileCopier {
         unitsDone = baselineUnits
 
         let tempPath = try drivePath(state.tempName)
+        try io.createDirectory(path: (tempPath as NSString).deletingLastPathComponent)
         let writer = try io.createWriter(path: tempPath, truncate: startIndex == 0)
         defer { try? writer.close() }
         let reader: (any DestinationReader)? = mode == .strict ? try io.openReader(path: tempPath) : nil
@@ -121,7 +126,9 @@ final class FileCopier {
             currentOffset = offset
             try checkInterrupt()
 
-            let read = try ChunkIO.readSource(source, into: bufferA, offset: offset, length: length) { _ in try self.checkInterrupt() }
+            let read = try ChunkIO.readSource(source, into: bufferA, offset: offset, length: length) { _ in
+                try self.checkInterrupt()
+            }
             if read != length { throw VerifyError.sourceChanged }
             sourceHasher.update(bufferA.bytes(count: length))
             let hash = StreamingHasher.hash(of: bufferA.bytes(count: length))
@@ -136,7 +143,10 @@ final class FileCopier {
                     self.reportProgress()
                 }
                 if let warning = try writer.flush() { addWarning(warning) }
-                guard let reader else { verified = true; break }
+                guard let reader else {
+                    verified = true
+                    break
+                }
 
                 let started = clock.now()
                 let got = try ChunkIO.readDestination(reader, into: bufferB, offset: offset, length: length) { done in
@@ -145,7 +155,10 @@ final class FileCopier {
                     self.reportProgress()
                 }
                 checkCacheGuard(bytes: got, seconds: clock.now() - started)
-                if got == length && bufferA.equals(bufferB, count: length) { verified = true; break }
+                if got == length && bufferA.equals(bufferB, count: length) {
+                    verified = true
+                    break
+                }
 
                 diff = bufferA.differences(from: bufferB, count: min(got, length))
                 if got < length { diff.append(BadRange(offset: Int64(got), length: Int64(length - got))) }
@@ -206,7 +219,8 @@ final class FileCopier {
         let buffer = AlignedBuffer(capacity: max(min(plan.chunkSize, Int(max(plan.size, 1))), Defaults.alignment))
         func chunkMatches(_ index: Int) throws -> Bool {
             let length = plan.length(of: index)
-            let got = try ChunkIO.readDestination(reader, into: buffer, offset: plan.offset(of: index), length: length) { _ in try self.checkInterrupt() }
+            let got = try ChunkIO.readDestination(reader, into: buffer, offset: plan.offset(of: index), length: length)
+            { _ in try self.checkInterrupt() }
             return got == length && StreamingHasher.hash(of: buffer.bytes(count: length)) == state.chunkHashes[index]
         }
         var firstBad: Int?
@@ -262,13 +276,14 @@ final class FileCopier {
         persist(state)
         let tempPath = try drivePath(state.tempName)
         let copyUnits = plan.size * (mode == .strict ? 2 : 1)
-        let passResult = try FinalPass.run(io: io, sourcePath: state.sourcePath, destinationPath: tempPath, plan: plan,
-                                           expectedChunkHashes: state.chunkHashes,
-                                           interrupt: { try self.checkInterrupt() },
-                                           progress: { done in
-                                               self.unitsDone = copyUnits + done
-                                               self.reportProgress()
-                                           })
+        let passResult = try FinalPass.run(
+            io: io, sourcePath: state.sourcePath, destinationPath: tempPath, plan: plan,
+            expectedChunkHashes: state.chunkHashes,
+            interrupt: { try self.checkInterrupt() },
+            progress: { done in
+                self.unitsDone = copyUnits + done
+                self.reportProgress()
+            })
         let allBad = ChunkIO.merge(state.badRanges + passResult.badRanges)
         if !allBad.isEmpty { return failed(.finalCheckMismatch, allBad) }
         if passResult.rereadHash != sourceHash { return failed(.wholeFileHashMismatch, []) }
@@ -325,7 +340,8 @@ final class FileCopier {
     /// A failed file never keeps a name that looks valid (decision D2, D5).
     private func renamePartialToFailed() {
         guard let temp = try? drivePath(state.tempName), io.fileSize(path: temp) != nil,
-              let failedPath = try? drivePath(state.finalName + Defaults.failedSuffix) else { return }
+            let failedPath = try? drivePath(state.finalName + Defaults.failedSuffix)
+        else { return }
         try? io.removeFile(path: failedPath)
         try? io.rename(from: temp, to: failedPath)
     }
@@ -362,7 +378,9 @@ final class FileCopier {
         let rate = Double(bytes) / seconds
         if rate > Defaults.cacheGuardBytesPerSecond {
             cacheWarned = true
-            addWarning("Read-back ran at \(Int(rate / 1_000_000)) MB/s, faster than a USB drive can deliver. The read probably came from a cache, so it is not trusted.")
+            addWarning(
+                "Read-back ran at \(Int(rate / 1_000_000)) MB/s, faster than a USB drive can deliver. The read probably came from a cache, so it is not trusted."
+            )
         }
     }
 
@@ -377,10 +395,12 @@ final class FileCopier {
         let speed = Double(max(unitsDone - baselineUnits, 0)) / elapsed
         let remaining = speed > 0 && total > done ? Double(total - done) / speed : nil
         let fileDone = plan.size == 0 ? 0 : min(plan.size, done * plan.size / total)
-        emit(.progress(ProgressSnapshot(
-            fileIndex: fileIndex, fileCount: fileCount, fileName: state.finalName, phase: phase,
-            fileBytesDone: fileDone, fileBytesTotal: plan.size, chunksVerified: state.chunkHashes.count,
-            chunksRetried: chunksRetried, bytesPerSecond: speed, secondsRemaining: remaining,
-            batchBytesDone: batchBytesBefore + fileDone, batchBytesTotal: batchBytesTotal)))
+        emit(
+            .progress(
+                ProgressSnapshot(
+                    fileIndex: fileIndex, fileCount: fileCount, fileName: state.finalName, phase: phase,
+                    fileBytesDone: fileDone, fileBytesTotal: plan.size, chunksVerified: state.chunkHashes.count,
+                    chunksRetried: chunksRetried, bytesPerSecond: speed, secondsRemaining: remaining,
+                    batchBytesDone: batchBytesBefore + fileDone, batchBytesTotal: batchBytesTotal)))
     }
 }
